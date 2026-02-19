@@ -22,16 +22,14 @@ class SyncManager:
         self.vault_path = os.path.abspath(vault_path)
         self._pat       = None
 
-        # Ensure vault folder exists
         os.makedirs(self.vault_path, exist_ok=True)
 
-        # Auto-init git repo if the folder isn't one yet
         try:
             self.repo = git.Repo(self.vault_path)
         except git.InvalidGitRepositoryError:
             self.repo = git.Repo.init(self.vault_path)
 
-    # ── Credential management ─────────────────
+    # ── Credentials ───────────────────────────
 
     def has_credentials(self) -> bool:
         return bool(keyring.get_password(KEYRING_SERVICE, KEYRING_USER))
@@ -49,21 +47,17 @@ class SyncManager:
         return keyring.get_password(KEYRING_SERVICE, "github_user") or ""
 
     def clear_credentials(self):
-        try:
-            keyring.delete_password(KEYRING_SERVICE, KEYRING_USER)
-        except Exception:
-            pass
-        try:
-            keyring.delete_password(KEYRING_SERVICE, "github_user")
-        except Exception:
-            pass
+        for key in (KEYRING_USER, "github_user"):
+            try:
+                keyring.delete_password(KEYRING_SERVICE, key)
+            except Exception:
+                pass
         self._pat = None
 
     def has_remote(self) -> bool:
         return "origin" in [r.name for r in self.repo.remotes]
 
     def set_remote(self, url: str):
-        """Set or update the origin remote URL (plain https, no PAT embedded)."""
         try:
             if self.has_remote():
                 self.repo.remotes.origin.set_url(url)
@@ -75,16 +69,28 @@ class SyncManager:
     # ── Auth URL ──────────────────────────────
 
     def _auth_url(self) -> str:
-        """Inject PAT into remote URL for authentication."""
         pat    = self.get_pat()
         user   = self.get_github_user()
         remote = self.repo.remotes.origin.url
-
-        # Strip any existing embedded credentials
         if "@" in remote:
             remote = "https://" + remote.split("@", 1)[-1]
-
         return remote.replace("https://", f"https://{user}:{pat}@")
+
+    # ── Ensure branch is 'main' ───────────────
+
+    def _ensure_main_branch(self):
+        """Rename local branch to 'main' if it's called 'master'."""
+        try:
+            if self.repo.active_branch.name == "master":
+                self.repo.git.branch("-m", "master", "main")
+        except Exception:
+            pass
+
+    def _has_upstream(self) -> bool:
+        try:
+            return self.repo.active_branch.tracking_branch() is not None
+        except Exception:
+            return False
 
     # ── Git operations ────────────────────────
 
@@ -94,7 +100,8 @@ class SyncManager:
         try:
             origin = self.repo.remotes.origin
             origin.set_url(self._auth_url())
-            origin.pull()
+            # Allow unrelated histories on first pull (remote has init commit)
+            self.repo.git.pull("--allow-unrelated-histories", "origin", "main")
             return True, "Pulled latest changes from GitHub."
         except git.GitCommandError as e:
             return False, f"Pull failed: {e}"
@@ -106,17 +113,22 @@ class SyncManager:
             return False, "No remote configured. Add your repo URL in Sync Setup."
         try:
             repo = self.repo
+            self._ensure_main_branch()
 
-            if not repo.is_dirty(untracked_files=True):
-                return True, "Nothing to commit — vault is already up to date."
-
+            # Stage everything
             repo.git.add(A=True)
+
+            # Nothing staged? nothing to do
+            if not repo.is_dirty(index=True, untracked_files=False):
+                # Check untracked too
+                if not repo.untracked_files:
+                    return True, "Nothing to commit — vault is already up to date."
 
             if not commit_message:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M")
                 commit_message = f"GhostWiki sync — {ts}"
 
-            # Set git identity if not already configured (avoids commit errors)
+            # Set git identity if missing
             with repo.config_writer() as cfg:
                 if not cfg.has_option("user", "email"):
                     cfg.set_value("user", "email", "ghostwiki@local")
@@ -127,7 +139,14 @@ class SyncManager:
 
             origin = repo.remotes.origin
             origin.set_url(self._auth_url())
-            origin.push()
+            branch = repo.active_branch.name
+
+            if self._has_upstream():
+                # Normal push
+                origin.push(refspec=f"{branch}:{branch}")
+            else:
+                # First push — force to overwrite GitHub's empty init commit
+                repo.git.push("--force", "--set-upstream", "origin", branch)
 
             return True, f"Pushed to GitHub: '{commit_message}'"
 
