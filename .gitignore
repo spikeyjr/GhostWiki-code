@@ -33,3 +33,4 @@ vault/
 # OS
 .DS_Store
 Thumbs.db
+*.desktop
